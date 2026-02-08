@@ -61,11 +61,7 @@ function getEventType(evOrText = "") {
   const text =
     typeof evOrText === "string"
       ? evOrText
-      : [
-          evOrText?.description,
-          evOrText?.summary,
-          evOrText?.location,
-        ]
+      : [evOrText?.description, evOrText?.summary, evOrText?.location]
           .filter(Boolean)
           .join("\n");
 
@@ -78,10 +74,6 @@ function isoDateUTC(d) {
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
-}
-
-function hoursBetween(a, b) {
-  return (b.getTime() - a.getTime()) / (1000 * 60 * 60);
 }
 
 function formatUTC(d) {
@@ -99,6 +91,10 @@ function addMonthsUTC(date, months) {
   return d;
 }
 
+function addHours(date, hours) {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000);
+}
+
 async function fetchEvents() {
   const data = await ical.fromURL(ICS_URL);
   return Object.values(data).filter((e) => e?.type === "VEVENT");
@@ -110,7 +106,7 @@ function makeKey(prefix, ev, suffix) {
   return `${prefix}_${uid}_${day}_${suffix}`;
 }
 
-// =================== Scheduled pings (AOO reminders) ===================
+// =================== Scheduled pings (AOO reminders via !aoo dropdown) ===================
 
 function schedulePing({ channelId, runAtMs, message }) {
   const id = `${channelId}_${runAtMs}_${Math.random().toString(16).slice(2)}`;
@@ -148,7 +144,6 @@ async function processScheduled(client, { silent = false } = {}) {
     }
   }
 
-  // cleanup
   const before = state.scheduled.length;
   state.scheduled = state.scheduled.filter((x) => !x.sent);
   if (state.scheduled.length !== before) changed = true;
@@ -156,7 +151,35 @@ async function processScheduled(client, { silent = false } = {}) {
   if (changed) saveState();
 }
 
-// =================== Announcement logic (your existing stuff) ===================
+// ✅ NEW: scheduled list helpers
+function formatDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(s / 86400);
+  const hrs = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hrs) parts.push(`${hrs}h`);
+  parts.push(`${mins}m`);
+  return parts.join(" ");
+}
+
+function chunkReplyLines(lines, maxLen = 1800) {
+  const chunks = [];
+  let cur = "";
+  for (const line of lines) {
+    if ((cur + line + "\n").length > maxLen) {
+      chunks.push(cur.trimEnd());
+      cur = "";
+    }
+    cur += line + "\n";
+  }
+  if (cur.trim().length) chunks.push(cur.trimEnd());
+  return chunks;
+}
+
+// =================== Announcement logic (MODIFIED per your rules) ===================
 
 async function runCheck(client, { silent = false } = {}) {
   const channel = await client.channels.fetch(CHANNEL_ID);
@@ -169,90 +192,108 @@ async function runCheck(client, { silent = false } = {}) {
   const events = await fetchEvents();
 
   for (const ev of events) {
-    const eventType = getEventType(ev); // ✅ changed
+    const eventType = getEventType(ev);
     if (!eventType) continue;
 
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
-    // 1) AOO Registration: Type = ark_registration
+    // -------------------------
+    // AOO Registration (ark_registration)
+    // -------------------------
     if (eventType === "ark_registration") {
-      const openKey = makeKey("AOO", ev, "open");
-      const warnKey = makeKey("AOO", ev, "24h_before_end");
+      const openKey = makeKey("AOO_REG", ev, "open_at_start");
+      const warnKey = makeKey("AOO_REG", ev, "6h_before_end");
+      const closeKey = makeKey("AOO_REG", ev, "closed_at_end");
 
+      const warnTime = addHours(end, -6);
+
+      // at start
       if (!state[openKey] && now >= start) {
         if (!silent) {
           await channel.send(
-            `${PING}\nAOO registration is open! Reach out to AOO team to apply.`
+            `${PING}\nAOO registration is opened, reach out to AOO team for registration!`
           );
         }
         state[openKey] = true;
         saveState();
       }
 
-      const hoursToEnd = hoursBetween(now, end);
-      if (!state[warnKey] && hoursToEnd <= 24 && hoursToEnd > 0) {
+      // 6h before end
+      if (!state[warnKey] && now >= warnTime && now < end) {
         if (!silent) {
           await channel.send(
-            `${PING}\nAOO registration ends in 1 day — don’t forget to register!`
+            `${PING}\nAOO registration will close soon, be sure you are registered!`
           );
         }
         state[warnKey] = true;
         saveState();
       }
-    }
 
-    // 2) MGE: Type = mge
-    if (eventType === "mge") {
-      const openKey = makeKey("mge", ev, "open_after_end");
-      const closeKey = makeKey("mge", ev, "closed_24h_before_start");
-
-      if (!state[openKey] && now >= end) {
+      // at end
+      if (!state[closeKey] && now >= end) {
         if (!silent) {
-          await channel.send(
-            `${PING}\nMGE registration is open! Reach out to <#1469846200042917918> channel for registration!`
-          );
-        }
-        state[openKey] = true;
-        saveState();
-      }
-
-      const hoursToStart = hoursBetween(now, start);
-      if (!state[closeKey] && hoursToStart <= 24 && hoursToStart > 0) {
-        if (!silent) {
-          await channel.send(`${PING}\nMGE registration is now closed.`);
+          await channel.send(`${PING}\nAOO registration closed`);
         }
         state[closeKey] = true;
         saveState();
       }
     }
 
-    // 3) 20 Gold Head Event: Type = goldhead
-    if (eventType === "goldhead") {
-      const warnKey = makeKey("goldhead", ev, "24h_before_start");
-      const hoursToStart = hoursBetween(now, start);
+    // -------------------------
+    // MGE (mge)
+    // -------------------------
+    if (eventType === "mge") {
+      const openKey = makeKey("MGE", ev, "open_24h_after_end");
+      const warnKey = makeKey("MGE", ev, "48h_before_start_warn_close_24h");
+      const closeKey = makeKey("MGE", ev, "closed_24h_before_start");
 
-      if (!state[warnKey] && hoursToStart <= 24 && hoursToStart > 0) {
+      const openTime = addHours(end, 24); // open 24h after end
+      const warnTime = addHours(start, -48); // warn at 48h before start
+      const closeTime = addHours(start, -24); // close at 24h before start
+
+      // open at end + 24h
+      if (!state[openKey] && now >= openTime) {
         if (!silent) {
           await channel.send(
-            `${PING}\n20 Gold Head Event starts in 1 day — get ready!`
+            `${PING}\nMGE registraton is open, register in <#1469846200042917918> channel, or reach out to mge team!`
+          );
+        }
+        state[openKey] = true;
+        saveState();
+      }
+
+      // warn at 48h before start
+      if (!state[warnKey] && now >= warnTime && now < closeTime) {
+        if (!silent) {
+          await channel.send(
+            `${PING}\nMGE registration closes in 24 hours , dont forget to apply!`
           );
         }
         state[warnKey] = true;
+        saveState();
+      }
+
+      // closed at 24h before start
+      if (!state[closeKey] && now >= closeTime && now < start) {
+        if (!silent) {
+          await channel.send(`${PING}\nMGE registration is closed`);
+        }
+        state[closeKey] = true;
         saveState();
       }
     }
   }
 }
 
-// ---------- Prefix command helpers ----------
+// ---------- Prefix command helpers (MODIFIED to match new rules) ----------
 
 async function getNextEventOfType(type) {
   const now = new Date();
   const events = await fetchEvents();
 
   const typed = events
-    .filter((ev) => getEventType(ev) === type) // ✅ changed
+    .filter((ev) => getEventType(ev) === type)
     .map((ev) => ({ ev, start: new Date(ev.start), end: new Date(ev.end) }))
     .filter((x) => x.start > now)
     .sort((a, b) => a.start - b.start);
@@ -266,46 +307,77 @@ async function getNextAnnouncementTime() {
   const candidates = [];
 
   for (const ev of events) {
-    const eventType = getEventType(ev); // ✅ changed
+    const eventType = getEventType(ev);
     if (!eventType) continue;
 
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
+    // AOO Registration rules
     if (eventType === "ark_registration") {
-      const openKey = makeKey("AOO", ev, "open");
-      const warnKey = makeKey("AOO", ev, "24h_before_end");
+      const openKey = makeKey("AOO_REG", ev, "open_at_start");
+      const warnKey = makeKey("AOO_REG", ev, "6h_before_end");
+      const closeKey = makeKey("AOO_REG", ev, "closed_at_end");
+
+      const warnTime = addHours(end, -6);
 
       if (!state[openKey] && start > now) {
-        candidates.push({ when: start, text: "AOO registration opens" });
+        candidates.push({
+          when: start,
+          text: "AOO registration is opened, reach out to AOO team for registration!",
+          key: openKey,
+        });
       }
 
-      const warnTime = new Date(end.getTime() - 24 * 60 * 60 * 1000);
       if (!state[warnKey] && warnTime > now) {
-        candidates.push({ when: warnTime, text: "AOO registration ends in 24h" });
+        candidates.push({
+          when: warnTime,
+          text: "AOO registration will close soon, be sure you are registered!",
+          key: warnKey,
+        });
+      }
+
+      if (!state[closeKey] && end > now) {
+        candidates.push({
+          when: end,
+          text: "AOO registration closed",
+          key: closeKey,
+        });
       }
     }
 
+    // MGE rules
     if (eventType === "mge") {
-      const openKey = makeKey("mge", ev, "open_after_end");
-      const closeKey = makeKey("mge", ev, "closed_24h_before_start");
+      const openKey = makeKey("MGE", ev, "open_24h_after_end");
+      const warnKey = makeKey("MGE", ev, "48h_before_start_warn_close_24h");
+      const closeKey = makeKey("MGE", ev, "closed_24h_before_start");
 
-      if (!state[openKey] && end > now) {
-        candidates.push({ when: end, text: "MGE registration opens" });
+      const openTime = addHours(end, 24);
+      const warnTime = addHours(start, -48);
+      const closeTime = addHours(start, -24);
+
+      if (!state[openKey] && openTime > now) {
+        candidates.push({
+          when: openTime,
+          text: "MGE registraton is open, register in 1469846200042917918 channel, or reach out to mge team!",
+          key: openKey,
+        });
       }
-
-      const closeTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
-      if (!state[closeKey] && closeTime > now) {
-        candidates.push({ when: closeTime, text: "MGE registration closes" });
-      }
-    }
-
-    if (eventType === "goldhead") {
-      const warnKey = makeKey("goldhead", ev, "24h_before_start");
-      const warnTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
 
       if (!state[warnKey] && warnTime > now) {
-        candidates.push({ when: warnTime, text: "20 Gold Head starts in 24h" });
+        candidates.push({
+          when: warnTime,
+          text: "MGE registration closes in 24 hours , dont forget to apply!",
+          key: warnKey,
+        });
+      }
+
+      if (!state[closeKey] && closeTime > now) {
+        candidates.push({
+          when: closeTime,
+          text: "MGE registration is closed",
+          key: closeKey,
+        });
       }
     }
   }
@@ -318,50 +390,78 @@ async function getAnnouncementsInNextMonths(months = 2) {
   const now = new Date();
   const until = addMonthsUTC(now, months);
   const events = await fetchEvents();
-
   const out = [];
 
   for (const ev of events) {
-    const eventType = getEventType(ev); // ✅ changed
+    const eventType = getEventType(ev);
     if (!eventType) continue;
 
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
     if (eventType === "ark_registration") {
-      const openKey = makeKey("AOO", ev, "open");
-      const warnKey = makeKey("AOO", ev, "24h_before_end");
+      const openKey = makeKey("AOO_REG", ev, "open_at_start");
+      const warnKey = makeKey("AOO_REG", ev, "6h_before_end");
+      const closeKey = makeKey("AOO_REG", ev, "closed_at_end");
+
+      const warnTime = addHours(end, -6);
 
       if (!state[openKey] && start >= now && start <= until) {
-        out.push({ when: start, text: "AOO registration opens", key: openKey });
+        out.push({
+          when: start,
+          text: "AOO registration is opened, reach out to AOO team for registration!",
+          key: openKey,
+        });
       }
 
-      const warnTime = new Date(end.getTime() - 24 * 60 * 60 * 1000);
       if (!state[warnKey] && warnTime >= now && warnTime <= until) {
-        out.push({ when: warnTime, text: "AOO registration ends in 24h", key: warnKey });
+        out.push({
+          when: warnTime,
+          text: "AOO registration will close soon, be sure you are registered!",
+          key: warnKey,
+        });
+      }
+
+      if (!state[closeKey] && end >= now && end <= until) {
+        out.push({
+          when: end,
+          text: "AOO registration closed",
+          key: closeKey,
+        });
       }
     }
 
     if (eventType === "mge") {
-      const openKey = makeKey("mge", ev, "open_after_end");
-      const closeKey = makeKey("mge", ev, "closed_24h_before_start");
+      const openKey = makeKey("MGE", ev, "open_24h_after_end");
+      const warnKey = makeKey("MGE", ev, "48h_before_start_warn_close_24h");
+      const closeKey = makeKey("MGE", ev, "closed_24h_before_start");
 
-      if (!state[openKey] && end >= now && end <= until) {
-        out.push({ when: end, text: "MGE registration opens", key: openKey });
+      const openTime = addHours(end, 24);
+      const warnTime = addHours(start, -48);
+      const closeTime = addHours(start, -24);
+
+      if (!state[openKey] && openTime >= now && openTime <= until) {
+        out.push({
+          when: openTime,
+          text: "MGE registraton is open, register in 1469846200042917918 channel, or reach out to mge team!",
+          key: openKey,
+        });
       }
-
-      const closeTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
-      if (!state[closeKey] && closeTime >= now && closeTime <= until) {
-        out.push({ when: closeTime, text: "MGE registration closes", key: closeKey });
-      }
-    }
-
-    if (eventType === "goldhead") {
-      const warnKey = makeKey("goldhead", ev, "24h_before_start");
-      const warnTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
 
       if (!state[warnKey] && warnTime >= now && warnTime <= until) {
-        out.push({ when: warnTime, text: "20 Gold Head starts in 24h", key: warnKey });
+        out.push({
+          when: warnTime,
+          text: "MGE registration closes in 24 hours , dont forget to apply!",
+          key: warnKey,
+        });
+      }
+
+      if (!state[closeKey] && closeTime >= now && closeTime <= until) {
+        out.push({
+          when: closeTime,
+          text: "MGE registration is closed",
+          key: closeKey,
+        });
       }
     }
   }
@@ -379,7 +479,7 @@ async function getAnnouncementsInNextMonths(months = 2) {
   return { items: deduped, until };
 }
 
-// =================== AOO dropdown flow (date -> hour) ===================
+// =================== AOO dropdown flow (KEEPED) ===================
 
 // ✅ IMPORTANT: your calendar uses Type: ark_battle for Ark of Osiris
 const AOO_TYPES = new Set(["ark_battle", "aoo"]);
@@ -389,7 +489,7 @@ async function getNextAooRunEvent() {
   const events = await fetchEvents();
 
   const aoo = events
-    .filter((ev) => AOO_TYPES.has(getEventType(ev))) // ✅ changed
+    .filter((ev) => AOO_TYPES.has(getEventType(ev)))
     .map((ev) => ({
       uid: ev.uid || "no_uid",
       start: new Date(ev.start),
@@ -460,6 +560,7 @@ function helpText() {
     `- ${PREFIX}next_announcement -> shows next scheduled announcement time (UTC)`,
     `- ${PREFIX}announcements_2m -> lists all announcements for next 2 months (UTC)`,
     `- ${PREFIX}aoo -> dropdown: pick AOO date + hour, schedules 30m/10m pings`,
+    `- ${PREFIX}scheduled_list -> shows scheduled reminders (UTC)`,
     `- ${PREFIX}ping -> bot health check`,
     `- ${PREFIX}help -> this list`,
   ].join("\n");
@@ -494,12 +595,14 @@ client.once("ready", async () => {
   );
 });
 
+// Handle dropdown interactions (select menus)
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.isStringSelectMenu()) return;
 
     const id = interaction.customId || "";
 
+    // Step 1: Date selection
     if (id.startsWith("aoo_date|")) {
       const [, startMsStr, endMsStr] = id.split("|");
       const startMs = Number(startMsStr);
@@ -520,6 +623,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // Step 2: Hour selection -> schedule pings
     if (id.startsWith("aoo_hour|")) {
       const parts = id.split("|");
       const startMs = Number(parts[1]);
@@ -629,14 +733,10 @@ client.on("messageCreate", async (msg) => {
     if (cmd === "next_announcement") {
       const next = await getNextAnnouncementTime();
       if (!next) {
-        await msg.reply(
-          "No upcoming announcements found (based on calendar + current state)."
-        );
+        await msg.reply("No upcoming announcements found (based on calendar + current state).");
         return;
       }
-      await msg.reply(
-        `Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`
-      );
+      await msg.reply(`Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`);
       return;
     }
 
@@ -644,29 +744,63 @@ client.on("messageCreate", async (msg) => {
       const { items, until } = await getAnnouncementsInNextMonths(2);
 
       if (!items.length) {
-        await msg.reply(
-          "No upcoming announcements in the next 2 months (based on calendar + current state)."
-        );
+        await msg.reply("No upcoming announcements in the next 2 months (based on calendar + current state).");
         return;
       }
 
       const header = `Upcoming announcements (UTC) until ${formatUTC(until)}:\n`;
       const lines = items.map((x, i) => `${i + 1}) ${formatUTC(x.when)} — ${x.text}`);
 
-      let chunk = header;
-      for (const line of lines) {
-        if ((chunk + line + "\n").length > 1800) {
-          await msg.reply("```" + chunk.trimEnd() + "```");
-          chunk = "";
-        }
-        chunk += line + "\n";
-      }
-      if (chunk.trim().length) {
-        await msg.reply("```" + chunk.trimEnd() + "```");
+      const chunks = chunkReplyLines([header.trimEnd(), ...lines], 1800);
+      for (const c of chunks) {
+        await msg.reply("```" + c + "```");
       }
       return;
     }
 
+    // ✅ NEW: list scheduled reminders (from !aoo selections)
+    if (cmd === "scheduled_list") {
+      const nowMs = Date.now();
+      const items = (state.scheduled || [])
+        .filter((x) => !x.sent)
+        .sort((a, b) => a.runAtMs - b.runAtMs);
+
+      if (!items.length) {
+        await msg.reply("No scheduled reminders right now.");
+        return;
+      }
+
+      const lines = [];
+      lines.push(`Scheduled reminders: ${items.length}`);
+      lines.push("");
+
+      const limited = items.slice(0, 40);
+      for (let i = 0; i < limited.length; i++) {
+        const it = limited[i];
+        const when = new Date(it.runAtMs);
+        const inTxt = formatDuration(it.runAtMs - nowMs);
+        const preview = String(it.message || "").replace(/\n/g, " ").slice(0, 120);
+
+        lines.push(
+          `${i + 1}) ${formatUTC(when)} (in ${inTxt}) — ${preview}${
+            preview.length === 120 ? "…" : ""
+          }`
+        );
+      }
+
+      if (items.length > limited.length) {
+        lines.push("");
+        lines.push(`(Showing first ${limited.length} of ${items.length})`);
+      }
+
+      const chunks = chunkReplyLines(lines, 1800);
+      for (const c of chunks) {
+        await msg.reply("```" + c + "```");
+      }
+      return;
+    }
+
+    // Keep your !aoo command
     if (cmd === "aoo") {
       const aoo = await getNextAooRunEvent();
       if (!aoo) {
