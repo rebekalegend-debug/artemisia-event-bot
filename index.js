@@ -19,10 +19,15 @@ const CHECK_EVERY_MINUTES = Number(process.env.CHECK_EVERY_MINUTES ?? "10");
 // Prefix commands
 const PREFIX = process.env.PREFIX ?? "!";
 
-// ✅ Role restriction (you gave the ID)
+// ✅ Roles (you provided IDs)
 const AOO_ROLE_ID = process.env.AOO_ROLE_ID ?? "1470120925856006277";
+const MGE_ROLE_ID = process.env.MGE_ROLE_ID ?? "1470122737002610760";
 
-// ✅ MGE channel mention (use env var if you set it; fallback to your ID)
+// ✅ Mentions
+const AOO_ROLE_MENTION = `<@&${AOO_ROLE_ID}>`;
+const MGE_ROLE_MENTION = `<@&${MGE_ROLE_ID}>`;
+
+// ✅ MGE channel mention (use env var if set; fallback to your ID)
 const MGE_CHANNEL_ID = process.env.MGE_CHANNEL_ID ?? "1469846200042917918";
 const MGE_CHANNEL_MENTION = `<#${MGE_CHANNEL_ID}>`;
 
@@ -191,7 +196,27 @@ function chunkReplyLines(lines, maxLen = 1800) {
   return chunks;
 }
 
-// =================== Announcement logic (MODIFIED per your rules) ===================
+// =================== Announcement logic (AOO+MGE only, per your rules) ===================
+
+function aooOpenMsg() {
+  return `AOO registration is opened, reach out to ${AOO_ROLE_MENTION} for registration!`;
+}
+function aooWarnMsg() {
+  return `AOO registration will close soon, be sure you are registered!`;
+}
+function aooClosedMsg() {
+  return `AOO registration closed`;
+}
+
+function mgeOpenMsg() {
+  return `MGE registraton is open, register in ${MGE_CHANNEL_MENTION} channel, or reach out to ${MGE_ROLE_MENTION} !`;
+}
+function mgeWarnMsg() {
+  return `MGE registration closes in 24 hours , dont forget to apply!`;
+}
+function mgeClosedMsg() {
+  return `MGE registration is closed`;
+}
 
 async function runCheck(client, { silent = false } = {}) {
   const channel = await client.channels.fetch(CHANNEL_ID);
@@ -210,9 +235,7 @@ async function runCheck(client, { silent = false } = {}) {
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
-    // -------------------------
     // AOO Registration (ark_registration)
-    // -------------------------
     if (eventType === "ark_registration") {
       const openKey = makeKey("AOO_REG", ev, "open_at_start");
       const warnKey = makeKey("AOO_REG", ev, "6h_before_end");
@@ -221,37 +244,25 @@ async function runCheck(client, { silent = false } = {}) {
       const warnTime = addHours(end, -6);
 
       if (!state[openKey] && now >= start) {
-        if (!silent) {
-          await channel.send(
-            `${PING}\nAOO registration is opened, reach out to AOO team for registration!`
-          );
-        }
+        if (!silent) await channel.send(`${PING}\n${aooOpenMsg()}`);
         state[openKey] = true;
         saveState();
       }
 
       if (!state[warnKey] && now >= warnTime && now < end) {
-        if (!silent) {
-          await channel.send(
-            `${PING}\nAOO registration will close soon, be sure you are registered!`
-          );
-        }
+        if (!silent) await channel.send(`${PING}\n${aooWarnMsg()}`);
         state[warnKey] = true;
         saveState();
       }
 
       if (!state[closeKey] && now >= end) {
-        if (!silent) {
-          await channel.send(`${PING}\nAOO registration closed`);
-        }
+        if (!silent) await channel.send(`${PING}\n${aooClosedMsg()}`);
         state[closeKey] = true;
         saveState();
       }
     }
 
-    // -------------------------
     // MGE (mge)
-    // -------------------------
     if (eventType === "mge") {
       const openKey = makeKey("MGE", ev, "open_24h_after_end");
       const warnKey = makeKey("MGE", ev, "48h_before_start_warn_close_24h");
@@ -262,29 +273,19 @@ async function runCheck(client, { silent = false } = {}) {
       const closeTime = addHours(start, -24);
 
       if (!state[openKey] && now >= openTime) {
-        if (!silent) {
-          await channel.send(
-            `${PING}\nMGE registraton is open, register in ${MGE_CHANNEL_MENTION} channel, or reach out to mge team!`
-          );
-        }
+        if (!silent) await channel.send(`${PING}\n${mgeOpenMsg()}`);
         state[openKey] = true;
         saveState();
       }
 
       if (!state[warnKey] && now >= warnTime && now < closeTime) {
-        if (!silent) {
-          await channel.send(
-            `${PING}\nMGE registration closes in 24 hours , dont forget to apply!`
-          );
-        }
+        if (!silent) await channel.send(`${PING}\n${mgeWarnMsg()}`);
         state[warnKey] = true;
         saveState();
       }
 
       if (!state[closeKey] && now >= closeTime && now < start) {
-        if (!silent) {
-          await channel.send(`${PING}\nMGE registration is closed`);
-        }
+        if (!silent) await channel.send(`${PING}\n${mgeClosedMsg()}`);
         state[closeKey] = true;
         saveState();
       }
@@ -307,7 +308,8 @@ async function getNextEventOfType(type) {
   return typed[0] || null;
 }
 
-async function getNextAnnouncementTime() {
+// returns the next *scheduled* announcement (future) based on state + calendar
+async function getNextAnnouncementItem() {
   const now = new Date();
   const events = await fetchEvents();
   const candidates = [];
@@ -326,29 +328,9 @@ async function getNextAnnouncementTime() {
 
       const warnTime = addHours(end, -6);
 
-      if (!state[openKey] && start > now) {
-        candidates.push({
-          when: start,
-          text: "AOO registration is opened, reach out to AOO team for registration!",
-          key: openKey,
-        });
-      }
-
-      if (!state[warnKey] && warnTime > now) {
-        candidates.push({
-          when: warnTime,
-          text: "AOO registration will close soon, be sure you are registered!",
-          key: warnKey,
-        });
-      }
-
-      if (!state[closeKey] && end > now) {
-        candidates.push({
-          when: end,
-          text: "AOO registration closed",
-          key: closeKey,
-        });
-      }
+      if (!state[openKey] && start > now) candidates.push({ when: start, text: aooOpenMsg(), key: openKey });
+      if (!state[warnKey] && warnTime > now) candidates.push({ when: warnTime, text: aooWarnMsg(), key: warnKey });
+      if (!state[closeKey] && end > now) candidates.push({ when: end, text: aooClosedMsg(), key: closeKey });
     }
 
     if (eventType === "mge") {
@@ -360,29 +342,9 @@ async function getNextAnnouncementTime() {
       const warnTime = addHours(start, -48);
       const closeTime = addHours(start, -24);
 
-      if (!state[openKey] && openTime > now) {
-        candidates.push({
-          when: openTime,
-          text: `MGE registraton is open, register in ${MGE_CHANNEL_MENTION} channel, or reach out to mge team!`,
-          key: openKey,
-        });
-      }
-
-      if (!state[warnKey] && warnTime > now) {
-        candidates.push({
-          when: warnTime,
-          text: "MGE registration closes in 24 hours , dont forget to apply!",
-          key: warnKey,
-        });
-      }
-
-      if (!state[closeKey] && closeTime > now) {
-        candidates.push({
-          when: closeTime,
-          text: "MGE registration is closed",
-          key: closeKey,
-        });
-      }
+      if (!state[openKey] && openTime > now) candidates.push({ when: openTime, text: mgeOpenMsg(), key: openKey });
+      if (!state[warnKey] && warnTime > now) candidates.push({ when: warnTime, text: mgeWarnMsg(), key: warnKey });
+      if (!state[closeKey] && closeTime > now) candidates.push({ when: closeTime, text: mgeClosedMsg(), key: closeKey });
     }
   }
 
@@ -410,29 +372,9 @@ async function getAnnouncementsInNextMonths(months = 2) {
 
       const warnTime = addHours(end, -6);
 
-      if (!state[openKey] && start >= now && start <= until) {
-        out.push({
-          when: start,
-          text: "AOO registration is opened, reach out to AOO team for registration!",
-          key: openKey,
-        });
-      }
-
-      if (!state[warnKey] && warnTime >= now && warnTime <= until) {
-        out.push({
-          when: warnTime,
-          text: "AOO registration will close soon, be sure you are registered!",
-          key: warnKey,
-        });
-      }
-
-      if (!state[closeKey] && end >= now && end <= until) {
-        out.push({
-          when: end,
-          text: "AOO registration closed",
-          key: closeKey,
-        });
-      }
+      if (!state[openKey] && start >= now && start <= until) out.push({ when: start, text: aooOpenMsg(), key: openKey });
+      if (!state[warnKey] && warnTime >= now && warnTime <= until) out.push({ when: warnTime, text: aooWarnMsg(), key: warnKey });
+      if (!state[closeKey] && end >= now && end <= until) out.push({ when: end, text: aooClosedMsg(), key: closeKey });
     }
 
     if (eventType === "mge") {
@@ -444,29 +386,9 @@ async function getAnnouncementsInNextMonths(months = 2) {
       const warnTime = addHours(start, -48);
       const closeTime = addHours(start, -24);
 
-      if (!state[openKey] && openTime >= now && openTime <= until) {
-        out.push({
-          when: openTime,
-          text: `MGE registraton is open, register in ${MGE_CHANNEL_MENTION} channel, or reach out to mge team!`,
-          key: openKey,
-        });
-      }
-
-      if (!state[warnKey] && warnTime >= now && warnTime <= until) {
-        out.push({
-          when: warnTime,
-          text: "MGE registration closes in 24 hours , dont forget to apply!",
-          key: warnKey,
-        });
-      }
-
-      if (!state[closeKey] && closeTime >= now && closeTime <= until) {
-        out.push({
-          when: closeTime,
-          text: "MGE registration is closed",
-          key: closeKey,
-        });
-      }
+      if (!state[openKey] && openTime >= now && openTime <= until) out.push({ when: openTime, text: mgeOpenMsg(), key: openKey });
+      if (!state[warnKey] && warnTime >= now && warnTime <= until) out.push({ when: warnTime, text: mgeWarnMsg(), key: warnKey });
+      if (!state[closeKey] && closeTime >= now && closeTime <= until) out.push({ when: closeTime, text: mgeClosedMsg(), key: closeKey });
     }
   }
 
@@ -508,14 +430,7 @@ async function getNextAooRunEvent() {
 function listUtcDatesInRange(start, end) {
   const dates = [];
   const d = new Date(
-    Date.UTC(
-      start.getUTCFullYear(),
-      start.getUTCMonth(),
-      start.getUTCDate(),
-      0,
-      0,
-      0
-    )
+    Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate(), 0, 0, 0)
   );
   const endDay = new Date(
     Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate(), 0, 0, 0)
@@ -560,9 +475,7 @@ function buildHourSelect({ startMs, endMs, dateISO }) {
     new StringSelectMenuBuilder()
       .setCustomId(`aoo_hour|${startMs}|${endMs}|${dateISO}`)
       .setPlaceholder("Select AOO start hour (UTC)")
-      .addOptions(
-        options.length ? options : [{ label: "No valid hours", value: "none" }]
-      )
+      .addOptions(options.length ? options : [{ label: "No valid hours", value: "none" }])
   );
 }
 
@@ -760,13 +673,20 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
+    // ✅ CHANGED: show next announcement like announcements_2m style
     if (cmd === "next_announcement") {
-      const next = await getNextAnnouncementTime();
+      const next = await getNextAnnouncementItem();
       if (!next) {
         await msg.reply("No upcoming announcements found (based on calendar + current state).");
         return;
       }
-      await msg.reply(`Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`);
+
+      const lines = [
+        "Next announcement (UTC):",
+        `1) ${formatUTC(next.when)} — ${next.text}`,
+      ];
+
+      await msg.reply("```" + lines.join("\n") + "```");
       return;
     }
 
@@ -778,10 +698,10 @@ client.on("messageCreate", async (msg) => {
         return;
       }
 
-      const header = `Upcoming announcements (UTC) until ${formatUTC(until)}:\n`;
+      const header = `Upcoming announcements (UTC) until ${formatUTC(until)}:`;
       const lines = items.map((x, i) => `${i + 1}) ${formatUTC(x.when)} — ${x.text}`);
 
-      const chunks = chunkReplyLines([header.trimEnd(), ...lines], 1800);
+      const chunks = chunkReplyLines([header, ...lines], 1800);
       for (const c of chunks) {
         await msg.reply("```" + c + "```");
       }
@@ -867,4 +787,3 @@ client.on("messageCreate", async (msg) => {
 });
 
 client.login(DISCORD_TOKEN);
-
