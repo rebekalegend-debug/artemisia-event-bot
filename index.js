@@ -1,5 +1,10 @@
 // index.js
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+} from "discord.js";
 import ical from "node-ical";
 import fs from "fs";
 import path from "path";
@@ -11,7 +16,7 @@ const ICS_URL = process.env.ICS_URL;
 const PING = process.env.PING_TEXT ?? "@everyone";
 const CHECK_EVERY_MINUTES = Number(process.env.CHECK_EVERY_MINUTES ?? "10");
 
-// Prefix commands (Option B)
+// Prefix commands
 const PREFIX = process.env.PREFIX ?? "!";
 
 // Persistent state (mount Railway Volume at /data)
@@ -25,6 +30,7 @@ if (!DISCORD_TOKEN || !CHANNEL_ID || !ICS_URL) {
 
 ensureStateDir();
 const state = loadState();
+state.scheduled ??= []; // scheduled pings storage
 
 function ensureStateDir() {
   try {
@@ -91,6 +97,57 @@ function makeKey(prefix, ev, suffix) {
   return `${prefix}_${uid}_${day}_${suffix}`;
 }
 
+// =================== Scheduled pings (AOO reminders) ===================
+
+function schedulePing({ channelId, runAtMs, message }) {
+  // stable-ish id
+  const id = `${channelId}_${runAtMs}_${Math.random().toString(16).slice(2)}`;
+  state.scheduled.push({
+    id,
+    channelId,
+    runAtMs,
+    message,
+    sent: false,
+  });
+  saveState();
+}
+
+async function processScheduled(client, { silent = false } = {}) {
+  const nowMs = Date.now();
+
+  let changed = false;
+
+  for (const item of state.scheduled) {
+    if (item.sent) continue;
+
+    if (nowMs >= item.runAtMs) {
+      if (!silent) {
+        try {
+          const ch = await client.channels.fetch(item.channelId);
+          if (ch && ch.isTextBased()) {
+            await ch.send(item.message);
+          }
+        } catch (e) {
+          console.error("Failed to send scheduled ping:", e);
+        }
+      }
+
+      // mark as sent no matter what (prevents restart catch-up spam)
+      item.sent = true;
+      changed = true;
+    }
+  }
+
+  // optional cleanup: keep file small
+  const before = state.scheduled.length;
+  state.scheduled = state.scheduled.filter((x) => !x.sent);
+  if (state.scheduled.length !== before) changed = true;
+
+  if (changed) saveState();
+}
+
+// =================== Announcement logic (your existing stuff) ===================
+
 async function runCheck(client, { silent = false } = {}) {
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (!channel || !channel.isTextBased()) {
@@ -113,7 +170,6 @@ async function runCheck(client, { silent = false } = {}) {
       const openKey = makeKey("AOO", ev, "open");
       const warnKey = makeKey("AOO", ev, "24h_before_end");
 
-      // at start
       if (!state[openKey] && now >= start) {
         if (!silent) {
           await channel.send(
@@ -124,7 +180,6 @@ async function runCheck(client, { silent = false } = {}) {
         saveState();
       }
 
-      // 24h before end
       const hoursToEnd = hoursBetween(now, end);
       if (!state[warnKey] && hoursToEnd <= 24 && hoursToEnd > 0) {
         if (!silent) {
@@ -142,7 +197,6 @@ async function runCheck(client, { silent = false } = {}) {
       const openKey = makeKey("mge", ev, "open_after_end");
       const closeKey = makeKey("mge", ev, "closed_24h_before_start");
 
-      // at end => registration open
       if (!state[openKey] && now >= end) {
         if (!silent) {
           await channel.send(
@@ -153,7 +207,6 @@ async function runCheck(client, { silent = false } = {}) {
         saveState();
       }
 
-      // 24h before start => registration closed
       const hoursToStart = hoursBetween(now, start);
       if (!state[closeKey] && hoursToStart <= 24 && hoursToStart > 0) {
         if (!silent) {
@@ -305,7 +358,6 @@ async function getAnnouncementsInNextMonths(months = 2) {
 
   out.sort((a, b) => a.when - b.when);
 
-  // De-dupe by key
   const seen = new Set();
   const deduped = [];
   for (const x of out) {
@@ -317,22 +369,95 @@ async function getAnnouncementsInNextMonths(months = 2) {
   return { items: deduped, until };
 }
 
+// =================== AOO dropdown flow (date -> hour) ===================
+
+// Find next AOO run event (Type: aoo)
+async function getNextAooRunEvent() {
+  const now = new Date();
+  const events = await fetchEvents();
+
+  const aoo = events
+    .filter((ev) => getEventType(ev.description || "") === "aoo")
+    .map((ev) => ({
+      uid: ev.uid || "no_uid",
+      start: new Date(ev.start),
+      end: new Date(ev.end),
+    }))
+    .filter((x) => x.end > now) // still relevant (ongoing or upcoming)
+    .sort((a, b) => a.start - b.start);
+
+  return aoo[0] || null;
+}
+
+// Get all dates (UTC) covered by [start, end) range
+function listUtcDatesInRange(start, end) {
+  const dates = [];
+  const d = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate(), 0, 0, 0));
+  const endDay = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate(), 0, 0, 0));
+
+  // iterate by day
+  while (d < endDay) {
+    dates.push(new Date(d.getTime()));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+function buildDateSelect({ startMs, endMs, dates }) {
+  const options = dates.slice(0, 25).map((d) => ({
+    label: isoDateUTC(d),
+    value: isoDateUTC(d),
+  }));
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`aoo_date|${startMs}|${endMs}`)
+      .setPlaceholder("Select AOO date (UTC)")
+      .addOptions(options)
+  );
+}
+
+function buildHourSelect({ startMs, endMs, dateISO }) {
+  const [yyyy, mm, dd] = dateISO.split("-").map((x) => Number(x));
+
+  // Build up to 24 hour options for that UTC date, but only those within event window
+  const options = [];
+  for (let h = 0; h < 24; h++) {
+    const t = Date.UTC(yyyy, mm - 1, dd, h, 0, 0, 0);
+    if (t >= startMs && t < endMs) {
+      options.push({
+        label: `${String(h).padStart(2, "0")}:00 UTC`,
+        value: String(h),
+      });
+    }
+  }
+
+  // Discord select max = 25 options, 24 is OK
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`aoo_hour|${startMs}|${endMs}|${dateISO}`)
+      .setPlaceholder("Select AOO start hour (UTC)")
+      .addOptions(options.length ? options : [{ label: "No valid hours", value: "none" }])
+  );
+}
+
+// =================== Help ===================
+
 function helpText() {
   return [
     `Commands (prefix: ${PREFIX})`,
     `- ${PREFIX}mge_start -> shows next MGE start time (UTC)`,
     `- ${PREFIX}next_announcement -> shows next scheduled announcement time (UTC)`,
     `- ${PREFIX}announcements_2m -> lists all announcements for next 2 months (UTC)`,
+    `- ${PREFIX}aoo -> dropdown: pick AOO date + hour, schedules 30m/10m pings`,
     `- ${PREFIX}ping -> bot health check`,
     `- ${PREFIX}help -> this list`,
   ].join("\n");
 }
 
-// ---------- Discord client ----------
+// =================== Discord client ===================
 
-// For prefix commands you MUST add MessageContent intent:
-// 1) Discord Developer Portal -> Bot -> enable "Message Content Intent"
-// 2) In code: GatewayIntentBits.MessageContent
+// For prefix commands you MUST enable Message Content Intent in Dev Portal.
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -346,6 +471,7 @@ client.once("ready", async () => {
 
   // Boot sync: mark already-due triggers as sent without posting (prevents restart spam)
   await runCheck(client, { silent: true });
+  await processScheduled(client, { silent: true });
 
   // Normal run
   await runCheck(client, { silent: false });
@@ -354,6 +480,115 @@ client.once("ready", async () => {
     () => runCheck(client, { silent: false }).catch(console.error),
     CHECK_EVERY_MINUTES * 60 * 1000
   );
+
+  // Process scheduled reminders every 30 seconds
+  setInterval(
+    () => processScheduled(client, { silent: false }).catch(console.error),
+    30 * 1000
+  );
+});
+
+// Handle dropdown interactions (select menus)
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isStringSelectMenu()) return;
+
+    const id = interaction.customId || "";
+
+    // Step 1: Date selection
+    if (id.startsWith("aoo_date|")) {
+      const [, startMsStr, endMsStr] = id.split("|");
+      const startMs = Number(startMsStr);
+      const endMs = Number(endMsStr);
+
+      const dateISO = interaction.values?.[0];
+      if (!dateISO) {
+        await interaction.reply({ content: "No date selected.", ephemeral: true });
+        return;
+      }
+
+      const hourRow = buildHourSelect({ startMs, endMs, dateISO });
+
+      await interaction.update({
+        content: `Selected date: **${dateISO}** (UTC)\nNow select the hour (UTC) you want AOO to start.`,
+        components: [hourRow],
+      });
+      return;
+    }
+
+    // Step 2: Hour selection -> schedule pings
+    if (id.startsWith("aoo_hour|")) {
+      const parts = id.split("|");
+      const startMs = Number(parts[1]);
+      const endMs = Number(parts[2]);
+      const dateISO = parts[3];
+
+      const hourStr = interaction.values?.[0];
+      if (!hourStr || hourStr === "none") {
+        await interaction.reply({ content: "No valid hour selected.", ephemeral: true });
+        return;
+      }
+
+      const hour = Number(hourStr);
+      const [yyyy, mm, dd] = dateISO.split("-").map((x) => Number(x));
+      const aooStartMs = Date.UTC(yyyy, mm - 1, dd, hour, 0, 0, 0);
+
+      if (!(aooStartMs >= startMs && aooStartMs < endMs)) {
+        await interaction.reply({
+          content: "That hour is outside the AOO event window. Try again.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const nowMs = Date.now();
+      const thirtyMs = aooStartMs - 30 * 60 * 1000;
+      const tenMs = aooStartMs - 10 * 60 * 1000;
+
+      // Schedule only if still in the future
+      const channelId = interaction.channelId;
+
+      let scheduledCount = 0;
+
+      if (thirtyMs > nowMs) {
+        schedulePing({
+          channelId,
+          runAtMs: thirtyMs,
+          message: `${PING}\nAOO starts in **30 minutes** — get ready! (Start: ${formatUTC(new Date(aooStartMs))})`,
+        });
+        scheduledCount++;
+      }
+
+      if (tenMs > nowMs) {
+        schedulePing({
+          channelId,
+          runAtMs: tenMs,
+          message: `${PING}\nAOO starts in **10 minutes** — be ready! (Start: ${formatUTC(new Date(aooStartMs))})`,
+        });
+        scheduledCount++;
+      }
+
+      const startText = formatUTC(new Date(aooStartMs));
+      const note =
+        scheduledCount === 0
+          ? "Both reminder times are already in the past, so nothing was scheduled."
+          : `Scheduled **${scheduledCount}** reminder(s).`;
+
+      await interaction.update({
+        content: `✅ AOO start selected: **${startText}**\n${note}`,
+        components: [], // remove dropdowns
+      });
+
+      return;
+    }
+  } catch (e) {
+    console.error("Interaction error:", e);
+    try {
+      if (interaction.isRepliable()) {
+        await interaction.reply({ content: "Error handling selection.", ephemeral: true });
+      }
+    } catch {}
+  }
 });
 
 client.on("messageCreate", async (msg) => {
@@ -415,7 +650,6 @@ client.on("messageCreate", async (msg) => {
         (x, i) => `${i + 1}) ${formatUTC(x.when)} — ${x.text}`
       );
 
-      // Chunk replies to stay under Discord limits
       let chunk = header;
       for (const line of lines) {
         if ((chunk + line + "\n").length > 1800) {
@@ -430,6 +664,37 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
+    // NEW: !aoo -> dropdown date -> hour -> schedules reminders
+    if (cmd === "aoo") {
+      const aoo = await getNextAooRunEvent();
+      if (!aoo) {
+        await msg.reply(
+          "No upcoming/ongoing AOO run event found. Make sure your calendar event description contains `Type: aoo`."
+        );
+        return;
+      }
+
+      const startMs = aoo.start.getTime();
+      const endMs = aoo.end.getTime();
+
+      const dates = listUtcDatesInRange(aoo.start, aoo.end);
+      if (!dates.length) {
+        await msg.reply("AOO event has no selectable dates (check start/end).");
+        return;
+      }
+
+      const dateRow = buildDateSelect({ startMs, endMs, dates });
+
+      await msg.reply({
+        content:
+          `AOO event window (UTC): **${formatUTC(aoo.start)}** → **${formatUTC(aoo.end)}**\n` +
+          `Select the date you want for the AOO start time:`,
+        components: [dateRow],
+      });
+
+      return;
+    }
+
     await msg.reply(`Unknown command. Try \`${PREFIX}help\``);
   } catch (e) {
     console.error("Command error:", e);
@@ -440,6 +705,3 @@ client.on("messageCreate", async (msg) => {
 });
 
 client.login(DISCORD_TOKEN);
-
-
-
