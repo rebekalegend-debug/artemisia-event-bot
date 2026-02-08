@@ -1,8 +1,5 @@
 // index.js
-import {
-  Client,
-  GatewayIntentBits,
-} from "discord.js";
+import { Client, GatewayIntentBits } from "discord.js";
 import ical from "node-ical";
 import fs from "fs";
 import path from "path";
@@ -77,6 +74,12 @@ function formatUTC(d) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi} UTC`;
 }
 
+function addMonthsUTC(date, months) {
+  const d = new Date(date.getTime());
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d;
+}
+
 async function fetchEvents() {
   const data = await ical.fromURL(ICS_URL);
   return Object.values(data).filter((e) => e?.type === "VEVENT");
@@ -95,14 +98,13 @@ async function runCheck(client, { silent = false } = {}) {
     return;
   }
 
-  const now = new Date(); // UTC-safe comparisons using timestamps
+  const now = new Date();
   const events = await fetchEvents();
 
   for (const ev of events) {
     const eventType = getEventType(ev.description || "");
     if (!eventType) continue;
 
-    // VALUE=DATE events often come as UTC midnight boundaries.
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
@@ -189,7 +191,7 @@ async function getNextEventOfType(type) {
   const typed = events
     .filter((ev) => getEventType(ev.description || "") === type)
     .map((ev) => ({ ev, start: new Date(ev.start), end: new Date(ev.end) }))
-    .filter((x) => x.start > now) // upcoming only
+    .filter((x) => x.start > now)
     .sort((a, b) => a.start - b.start);
 
   return typed[0] || null;
@@ -211,12 +213,10 @@ async function getNextAnnouncementTime() {
       const openKey = makeKey("AOO", ev, "open");
       const warnKey = makeKey("AOO", ev, "24h_before_end");
 
-      // "open" trigger at start
       if (!state[openKey] && start > now) {
         candidates.push({ when: start, text: "AOO registration opens" });
       }
 
-      // warn trigger exactly 24h before end
       const warnTime = new Date(end.getTime() - 24 * 60 * 60 * 1000);
       if (!state[warnKey] && warnTime > now) {
         candidates.push({ when: warnTime, text: "AOO registration ends in 24h" });
@@ -227,12 +227,10 @@ async function getNextAnnouncementTime() {
       const openKey = makeKey("mge", ev, "open_after_end");
       const closeKey = makeKey("mge", ev, "closed_24h_before_start");
 
-      // "open" trigger at end
       if (!state[openKey] && end > now) {
         candidates.push({ when: end, text: "MGE registration opens" });
       }
 
-      // "close" trigger exactly 24h before start
       const closeTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
       if (!state[closeKey] && closeTime > now) {
         candidates.push({ when: closeTime, text: "MGE registration closes" });
@@ -253,11 +251,78 @@ async function getNextAnnouncementTime() {
   return candidates[0] || null;
 }
 
+async function getAnnouncementsInNextMonths(months = 2) {
+  const now = new Date();
+  const until = addMonthsUTC(now, months);
+  const events = await fetchEvents();
+
+  const out = [];
+
+  for (const ev of events) {
+    const eventType = getEventType(ev.description || "");
+    if (!eventType) continue;
+
+    const start = new Date(ev.start);
+    const end = new Date(ev.end);
+
+    if (eventType === "ark_registration") {
+      const openKey = makeKey("AOO", ev, "open");
+      const warnKey = makeKey("AOO", ev, "24h_before_end");
+
+      if (!state[openKey] && start >= now && start <= until) {
+        out.push({ when: start, text: "AOO registration opens", key: openKey });
+      }
+
+      const warnTime = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+      if (!state[warnKey] && warnTime >= now && warnTime <= until) {
+        out.push({ when: warnTime, text: "AOO registration ends in 24h", key: warnKey });
+      }
+    }
+
+    if (eventType === "mge") {
+      const openKey = makeKey("mge", ev, "open_after_end");
+      const closeKey = makeKey("mge", ev, "closed_24h_before_start");
+
+      if (!state[openKey] && end >= now && end <= until) {
+        out.push({ when: end, text: "MGE registration opens", key: openKey });
+      }
+
+      const closeTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+      if (!state[closeKey] && closeTime >= now && closeTime <= until) {
+        out.push({ when: closeTime, text: "MGE registration closes", key: closeKey });
+      }
+    }
+
+    if (eventType === "goldhead") {
+      const warnKey = makeKey("goldhead", ev, "24h_before_start");
+      const warnTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+
+      if (!state[warnKey] && warnTime >= now && warnTime <= until) {
+        out.push({ when: warnTime, text: "20 Gold Head starts in 24h", key: warnKey });
+      }
+    }
+  }
+
+  out.sort((a, b) => a.when - b.when);
+
+  // De-dupe by key
+  const seen = new Set();
+  const deduped = [];
+  for (const x of out) {
+    if (seen.has(x.key)) continue;
+    seen.add(x.key);
+    deduped.push(x);
+  }
+
+  return { items: deduped, until };
+}
+
 function helpText() {
   return [
     `Commands (prefix: ${PREFIX})`,
-    `- ${PREFIX}mge_start  -> shows next MGE start time (UTC)`,
+    `- ${PREFIX}mge_start -> shows next MGE start time (UTC)`,
     `- ${PREFIX}next_announcement -> shows next scheduled announcement time (UTC)`,
+    `- ${PREFIX}announcements_2m -> lists all announcements for next 2 months (UTC)`,
     `- ${PREFIX}ping -> bot health check`,
     `- ${PREFIX}help -> this list`,
   ].join("\n");
@@ -266,7 +331,7 @@ function helpText() {
 // ---------- Discord client ----------
 
 // For prefix commands you MUST add MessageContent intent:
-// 1) In Discord Developer Portal -> Bot -> "Message Content Intent" ENABLE
+// 1) Discord Developer Portal -> Bot -> enable "Message Content Intent"
 // 2) In code: GatewayIntentBits.MessageContent
 const client = new Client({
   intents: [
@@ -294,7 +359,7 @@ client.once("ready", async () => {
 client.on("messageCreate", async (msg) => {
   try {
     if (msg.author?.bot) return;
-    if (!msg.guild) return; // ignore DMs for now
+    if (!msg.guild) return;
     if (!msg.content?.startsWith(PREFIX)) return;
 
     const content = msg.content.slice(PREFIX.length).trim();
@@ -324,14 +389,47 @@ client.on("messageCreate", async (msg) => {
     if (cmd === "next_announcement") {
       const next = await getNextAnnouncementTime();
       if (!next) {
-        await msg.reply("No upcoming announcements found (based on calendar + current state).");
+        await msg.reply(
+          "No upcoming announcements found (based on calendar + current state)."
+        );
         return;
       }
-      await msg.reply(`Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`);
+      await msg.reply(
+        `Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`
+      );
       return;
     }
 
-    // unknown command
+    if (cmd === "announcements_2m") {
+      const { items, until } = await getAnnouncementsInNextMonths(2);
+
+      if (!items.length) {
+        await msg.reply(
+          "No upcoming announcements in the next 2 months (based on calendar + current state)."
+        );
+        return;
+      }
+
+      const header = `Upcoming announcements (UTC) until ${formatUTC(until)}:\n`;
+      const lines = items.map(
+        (x, i) => `${i + 1}) ${formatUTC(x.when)} — ${x.text}`
+      );
+
+      // Chunk replies to stay under Discord limits
+      let chunk = header;
+      for (const line of lines) {
+        if ((chunk + line + "\n").length > 1800) {
+          await msg.reply("```" + chunk.trimEnd() + "```");
+          chunk = "";
+        }
+        chunk += line + "\n";
+      }
+      if (chunk.trim().length) {
+        await msg.reply("```" + chunk.trimEnd() + "```");
+      }
+      return;
+    }
+
     await msg.reply(`Unknown command. Try \`${PREFIX}help\``);
   } catch (e) {
     console.error("Command error:", e);
@@ -342,5 +440,6 @@ client.on("messageCreate", async (msg) => {
 });
 
 client.login(DISCORD_TOKEN);
+
 
 
