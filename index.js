@@ -1,5 +1,8 @@
 // index.js
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+} from "discord.js";
 import ical from "node-ical";
 import fs from "fs";
 import path from "path";
@@ -11,8 +14,10 @@ const ICS_URL = process.env.ICS_URL;
 const PING = process.env.PING_TEXT ?? "@everyone";
 const CHECK_EVERY_MINUTES = Number(process.env.CHECK_EVERY_MINUTES ?? "10");
 
-// IMPORTANT: use a persistent dir if you mount a Railway Volume at /data
-// If you don't mount a volume, it will still work, but state resets on redeploy.
+// Prefix commands (Option B)
+const PREFIX = process.env.PREFIX ?? "!";
+
+// Persistent state (mount Railway Volume at /data)
 const STATE_DIR = process.env.STATE_DIR ?? "/data";
 const stateFile = path.resolve(STATE_DIR, "state.json");
 
@@ -63,6 +68,15 @@ function hoursBetween(a, b) {
   return (b.getTime() - a.getTime()) / (1000 * 60 * 60);
 }
 
+function formatUTC(d) {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi} UTC`;
+}
+
 async function fetchEvents() {
   const data = await ical.fromURL(ICS_URL);
   return Object.values(data).filter((e) => e?.type === "VEVENT");
@@ -88,7 +102,7 @@ async function runCheck(client, { silent = false } = {}) {
     const eventType = getEventType(ev.description || "");
     if (!eventType) continue;
 
-    // Calendar uses VALUE=DATE events (all-day). Start/end are UTC midnight boundaries.
+    // VALUE=DATE events often come as UTC midnight boundaries.
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
@@ -166,17 +180,109 @@ async function runCheck(client, { silent = false } = {}) {
   }
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// ---------- Prefix command helpers ----------
+
+async function getNextEventOfType(type) {
+  const now = new Date();
+  const events = await fetchEvents();
+
+  const typed = events
+    .filter((ev) => getEventType(ev.description || "") === type)
+    .map((ev) => ({ ev, start: new Date(ev.start), end: new Date(ev.end) }))
+    .filter((x) => x.start > now) // upcoming only
+    .sort((a, b) => a.start - b.start);
+
+  return typed[0] || null;
+}
+
+async function getNextAnnouncementTime() {
+  const now = new Date();
+  const events = await fetchEvents();
+  const candidates = [];
+
+  for (const ev of events) {
+    const eventType = getEventType(ev.description || "");
+    if (!eventType) continue;
+
+    const start = new Date(ev.start);
+    const end = new Date(ev.end);
+
+    if (eventType === "ark_registration") {
+      const openKey = makeKey("AOO", ev, "open");
+      const warnKey = makeKey("AOO", ev, "24h_before_end");
+
+      // "open" trigger at start
+      if (!state[openKey] && start > now) {
+        candidates.push({ when: start, text: "AOO registration opens" });
+      }
+
+      // warn trigger exactly 24h before end
+      const warnTime = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+      if (!state[warnKey] && warnTime > now) {
+        candidates.push({ when: warnTime, text: "AOO registration ends in 24h" });
+      }
+    }
+
+    if (eventType === "mge") {
+      const openKey = makeKey("mge", ev, "open_after_end");
+      const closeKey = makeKey("mge", ev, "closed_24h_before_start");
+
+      // "open" trigger at end
+      if (!state[openKey] && end > now) {
+        candidates.push({ when: end, text: "MGE registration opens" });
+      }
+
+      // "close" trigger exactly 24h before start
+      const closeTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+      if (!state[closeKey] && closeTime > now) {
+        candidates.push({ when: closeTime, text: "MGE registration closes" });
+      }
+    }
+
+    if (eventType === "goldhead") {
+      const warnKey = makeKey("goldhead", ev, "24h_before_start");
+      const warnTime = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+
+      if (!state[warnKey] && warnTime > now) {
+        candidates.push({ when: warnTime, text: "20 Gold Head starts in 24h" });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => a.when - b.when);
+  return candidates[0] || null;
+}
+
+function helpText() {
+  return [
+    `Commands (prefix: ${PREFIX})`,
+    `- ${PREFIX}mge_start  -> shows next MGE start time (UTC)`,
+    `- ${PREFIX}next_announcement -> shows next scheduled announcement time (UTC)`,
+    `- ${PREFIX}ping -> bot health check`,
+    `- ${PREFIX}help -> this list`,
+  ].join("\n");
+}
+
+// ---------- Discord client ----------
+
+// For prefix commands you MUST add MessageContent intent:
+// 1) In Discord Developer Portal -> Bot -> "Message Content Intent" ENABLE
+// 2) In code: GatewayIntentBits.MessageContent
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // BOOT SYNC:
-  // Mark anything already "due" as sent without posting messages.
-  // This prevents spam after Railway redeploy/restart.
+  // Boot sync: mark already-due triggers as sent without posting (prevents restart spam)
   await runCheck(client, { silent: true });
 
-  // Optional: immediately run once normally after boot sync (won't spam)
+  // Normal run
   await runCheck(client, { silent: false });
 
   setInterval(
@@ -185,4 +291,56 @@ client.once("ready", async () => {
   );
 });
 
+client.on("messageCreate", async (msg) => {
+  try {
+    if (msg.author?.bot) return;
+    if (!msg.guild) return; // ignore DMs for now
+    if (!msg.content?.startsWith(PREFIX)) return;
+
+    const content = msg.content.slice(PREFIX.length).trim();
+    const [cmdRaw] = content.split(/\s+/);
+    const cmd = (cmdRaw || "").toLowerCase();
+
+    if (cmd === "ping") {
+      await msg.reply("pong");
+      return;
+    }
+
+    if (cmd === "help") {
+      await msg.reply("```" + helpText() + "```");
+      return;
+    }
+
+    if (cmd === "mge_start") {
+      const next = await getNextEventOfType("mge");
+      if (!next) {
+        await msg.reply("No upcoming MGE event found in the calendar.");
+        return;
+      }
+      await msg.reply(`Next MGE starts at **${formatUTC(next.start)}**.`);
+      return;
+    }
+
+    if (cmd === "next_announcement") {
+      const next = await getNextAnnouncementTime();
+      if (!next) {
+        await msg.reply("No upcoming announcements found (based on calendar + current state).");
+        return;
+      }
+      await msg.reply(`Next announcement: **${next.text}** at **${formatUTC(next.when)}**.`);
+      return;
+    }
+
+    // unknown command
+    await msg.reply(`Unknown command. Try \`${PREFIX}help\``);
+  } catch (e) {
+    console.error("Command error:", e);
+    try {
+      await msg.reply("Error while processing command.");
+    } catch {}
+  }
+});
+
 client.login(DISCORD_TOKEN);
+
+
