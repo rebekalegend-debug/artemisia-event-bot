@@ -1,3 +1,4 @@
+// index.js
 import { Client, GatewayIntentBits } from "discord.js";
 import ical from "node-ical";
 import fs from "fs";
@@ -10,13 +11,26 @@ const ICS_URL = process.env.ICS_URL;
 const PING = process.env.PING_TEXT ?? "@everyone";
 const CHECK_EVERY_MINUTES = Number(process.env.CHECK_EVERY_MINUTES ?? "10");
 
+// IMPORTANT: use a persistent dir if you mount a Railway Volume at /data
+// If you don't mount a volume, it will still work, but state resets on redeploy.
+const STATE_DIR = process.env.STATE_DIR ?? "/data";
+const stateFile = path.resolve(STATE_DIR, "state.json");
+
 if (!DISCORD_TOKEN || !CHANNEL_ID || !ICS_URL) {
   console.error("Missing env vars: DISCORD_TOKEN, CHANNEL_ID, ICS_URL");
   process.exit(1);
 }
 
-const stateFile = path.resolve("./state.json");
+ensureStateDir();
 const state = loadState();
+
+function ensureStateDir() {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+  } catch (e) {
+    console.error("Failed to create STATE_DIR:", STATE_DIR, e);
+  }
+}
 
 function loadState() {
   try {
@@ -26,7 +40,11 @@ function loadState() {
   }
 }
 function saveState() {
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  try {
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.error("Failed to save state:", e);
+  }
 }
 
 function getEventType(description = "") {
@@ -52,11 +70,11 @@ async function fetchEvents() {
 
 function makeKey(prefix, ev, suffix) {
   const uid = ev.uid || "no_uid";
-  const day = isoDateUTC(ev.start);
+  const day = isoDateUTC(new Date(ev.start));
   return `${prefix}_${uid}_${day}_${suffix}`;
 }
 
-async function runCheck(client) {
+async function runCheck(client, { silent = false } = {}) {
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (!channel || !channel.isTextBased()) {
     console.error("Channel not found or not text-based.");
@@ -70,7 +88,7 @@ async function runCheck(client) {
     const eventType = getEventType(ev.description || "");
     if (!eventType) continue;
 
-    // Calendar uses VALUE=DATE events (all-day). Start/end are UTC midnight boundaries. :contentReference[oaicite:1]{index=1}
+    // Calendar uses VALUE=DATE events (all-day). Start/end are UTC midnight boundaries.
     const start = new Date(ev.start);
     const end = new Date(ev.end);
 
@@ -81,9 +99,11 @@ async function runCheck(client) {
 
       // at start
       if (!state[openKey] && now >= start) {
-        await channel.send(
-          `${PING}\nAOO registration is open! Reach out to AOO team to apply.`
-        );
+        if (!silent) {
+          await channel.send(
+            `${PING}\nAOO registration is open! Reach out to AOO team to apply.`
+          );
+        }
         state[openKey] = true;
         saveState();
       }
@@ -91,9 +111,11 @@ async function runCheck(client) {
       // 24h before end
       const hoursToEnd = hoursBetween(now, end);
       if (!state[warnKey] && hoursToEnd <= 24 && hoursToEnd > 0) {
-        await channel.send(
-          `${PING}\nAOO registration ends in 1 day — don’t forget to register!`
-        );
+        if (!silent) {
+          await channel.send(
+            `${PING}\nAOO registration ends in 1 day — don’t forget to register!`
+          );
+        }
         state[warnKey] = true;
         saveState();
       }
@@ -106,10 +128,11 @@ async function runCheck(client) {
 
       // at end => registration open
       if (!state[openKey] && now >= end) {
-        await channel.send(
-  `${PING}\nMGE registration is open! Reach out to <#1469846200042917918> channel for registration!`
-);
-
+        if (!silent) {
+          await channel.send(
+            `${PING}\nMGE registration is open! Reach out to <#1469846200042917918> channel for registration!`
+          );
+        }
         state[openKey] = true;
         saveState();
       }
@@ -117,7 +140,9 @@ async function runCheck(client) {
       // 24h before start => registration closed
       const hoursToStart = hoursBetween(now, start);
       if (!state[closeKey] && hoursToStart <= 24 && hoursToStart > 0) {
-        await channel.send(`${PING}\nMGE registration is now closed.`);
+        if (!silent) {
+          await channel.send(`${PING}\nMGE registration is now closed.`);
+        }
         state[closeKey] = true;
         saveState();
       }
@@ -129,9 +154,11 @@ async function runCheck(client) {
       const hoursToStart = hoursBetween(now, start);
 
       if (!state[warnKey] && hoursToStart <= 24 && hoursToStart > 0) {
-        await channel.send(
-          `${PING}\n20 Gold Head Event starts in 1 day — get ready!`
-        );
+        if (!silent) {
+          await channel.send(
+            `${PING}\n20 Gold Head Event starts in 1 day — get ready!`
+          );
+        }
         state[warnKey] = true;
         saveState();
       }
@@ -143,10 +170,19 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  await runCheck(client);
-  setInterval(() => runCheck(client).catch(console.error), CHECK_EVERY_MINUTES * 60 * 1000);
+
+  // BOOT SYNC:
+  // Mark anything already "due" as sent without posting messages.
+  // This prevents spam after Railway redeploy/restart.
+  await runCheck(client, { silent: true });
+
+  // Optional: immediately run once normally after boot sync (won't spam)
+  await runCheck(client, { silent: false });
+
+  setInterval(
+    () => runCheck(client, { silent: false }).catch(console.error),
+    CHECK_EVERY_MINUTES * 60 * 1000
+  );
 });
 
 client.login(DISCORD_TOKEN);
-
-
