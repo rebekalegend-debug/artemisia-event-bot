@@ -1,10 +1,8 @@
-
 // index.js
 import {
   Client,
   GatewayIntentBits,
-  ActionRowBuilder,
-  StringSelectMenuBuilder,
+  PermissionsBitField,
 } from "discord.js";
 import ical from "node-ical";
 import fs from "fs";
@@ -13,17 +11,13 @@ import path from "path";
 /* ================= ENV ================= */
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID; // fallback ping channel
 const ICS_URL = process.env.ICS_URL;
 
 const PING = process.env.PING_TEXT ?? "@everyone";
 const CHECK_EVERY_MINUTES = Number(process.env.CHECK_EVERY_MINUTES ?? "10");
 const PREFIX = process.env.PREFIX ?? "!";
 
-// Roles
-const AOO_ROLE_ID = process.env.AOO_ROLE_ID ?? "1470120925856006277";
-
-// State
+// Persistent state (Railway volume at /data)
 const STATE_DIR = process.env.STATE_DIR ?? "/data";
 const stateFile = path.resolve(STATE_DIR, "state.json");
 
@@ -39,14 +33,25 @@ const state = loadState();
 
 state.scheduled ??= [];
 state.config ??= {
-  pingChannelId: CHANNEL_ID ?? null,
+  // where bot posts automatic announcements
+  pingChannelId: null,
+
+  // who can use bot commands (set by command)
+  accessRoleId: null,
+
+  // message mentions (set by command)
+  aooTeamRoleId: null,
   mgeChannelId: null,
   mgeRoleId: null,
 };
 saveState();
 
 function ensureStateDir() {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+  } catch (e) {
+    console.error("Failed to create STATE_DIR:", STATE_DIR, e);
+  }
 }
 
 function loadState() {
@@ -58,17 +63,42 @@ function loadState() {
 }
 
 function saveState() {
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  try {
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.error("Failed to save state:", e);
+  }
 }
 
 /* ================= HELPERS ================= */
 
-function hasAooRole(member) {
-  return member?.roles?.cache?.has(AOO_ROLE_ID);
+function isAdmin(member) {
+  try {
+    return member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+  } catch {
+    return false;
+  }
 }
 
-function getPingChannelId() {
-  return state.config.pingChannelId || CHANNEL_ID;
+// Access rule:
+// - If accessRoleId is set: member must have it
+// - If not set yet: only Admins can run commands (bootstrap)
+function canUseCommands(member) {
+  const roleId = state.config.accessRoleId;
+  if (!roleId) return isAdmin(member);
+  return member?.roles?.cache?.has(roleId);
+}
+
+function getPingChannelId(fallbackFromMessageChannelId = null) {
+  return (
+    state.config.pingChannelId ||
+    fallbackFromMessageChannelId ||
+    null
+  );
+}
+
+function getAooRoleMention() {
+  return state.config.aooTeamRoleId ? `<@&${state.config.aooTeamRoleId}>` : "";
 }
 
 function getMgeChannelMention() {
@@ -95,17 +125,31 @@ function getEventType(evOrText = "") {
   return m ? m[1].toLowerCase() : null;
 }
 
+function isoDateUTC(d) {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 function formatUTC(d) {
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
-    2,
-    "0"
-  )}-${String(d.getUTCDate()).padStart(2, "0")} ${String(
-    d.getUTCHours()
-  ).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi} UTC`;
 }
 
 function addHours(date, h) {
   return new Date(date.getTime() + h * 3600000);
+}
+
+// Stable key per event + UTC day + moment
+function makeKey(prefix, ev, suffix) {
+  const uid = ev?.uid || ev?.id || "no_uid";
+  const day = isoDateUTC(new Date(ev.start));
+  return `${prefix}_${uid}_${day}_${suffix}`;
 }
 
 async function fetchEvents() {
@@ -116,7 +160,10 @@ async function fetchEvents() {
 /* ================= MESSAGES ================= */
 
 function aooOpenMsg() {
-  return `AOO registration is opened, reach out to <@&${AOO_ROLE_ID}> for registration!`;
+  const role = getAooRoleMention();
+  return role
+    ? `AOO registration is opened, reach out to ${role} for registration!`
+    : `AOO registration is opened. Reach out to the AOO team for registration!`;
 }
 function aooWarnMsg() {
   return `AOO registration will close soon, be sure you are registered!`;
@@ -137,71 +184,89 @@ function mgeClosedMsg() {
 
 /* ================= ANNOUNCEMENTS ================= */
 
+let runCheckRunning = false;
+
 async function runCheck(client) {
-  const channel = await client.channels.fetch(getPingChannelId());
-  if (!channel?.isTextBased()) return;
+  if (runCheckRunning) return;
+  runCheckRunning = true;
 
-  const now = new Date();
-  const events = await fetchEvents();
+  try {
+    const pingChannelId = getPingChannelId();
+    if (!pingChannelId) return; // not configured yet
 
-  for (const ev of events) {
-    const type = getEventType(ev);
-    if (!type) continue;
+    const channel = await client.channels.fetch(pingChannelId);
+    if (!channel?.isTextBased()) return;
 
-    const start = new Date(ev.start);
-    const end = new Date(ev.end);
+    const now = new Date();
+    const events = await fetchEvents();
 
-    if (type === "ark_registration") {
-      if (!state[`aoo_open_${ev.uid}`] && now >= start) {
-        await channel.send(`${PING}\n${aooOpenMsg()}`);
-        state[`aoo_open_${ev.uid}`] = true;
-        saveState();
+    for (const ev of events) {
+      const type = getEventType(ev);
+      if (!type) continue;
+
+      const start = new Date(ev.start);
+      const end = new Date(ev.end);
+
+      // AOO registration
+      if (type === "ark_registration") {
+        const openKey = makeKey("AOO_REG", ev, "open_at_start");
+        const warnKey = makeKey("AOO_REG", ev, "6h_before_end");
+        const closeKey = makeKey("AOO_REG", ev, "closed_at_end");
+
+        const warnTime = addHours(end, -6);
+
+        if (!state[openKey] && now >= start) {
+          await channel.send(`${PING}\n${aooOpenMsg()}`);
+          state[openKey] = true;
+          saveState();
+        }
+
+        if (!state[warnKey] && now >= warnTime && now < end) {
+          await channel.send(`${PING}\n${aooWarnMsg()}`);
+          state[warnKey] = true;
+          saveState();
+        }
+
+        if (!state[closeKey] && now >= end) {
+          await channel.send(`${PING}\n${aooClosedMsg()}`);
+          state[closeKey] = true;
+          saveState();
+        }
       }
 
-      if (
-        !state[`aoo_warn_${ev.uid}`] &&
-        now >= addHours(end, -6) &&
-        now < end
-      ) {
-        await channel.send(`${PING}\n${aooWarnMsg()}`);
-        state[`aoo_warn_${ev.uid}`] = true;
-        saveState();
-      }
+      // MGE
+      if (type === "mge") {
+        const openKey = makeKey("MGE", ev, "open_24h_after_end");
+        const warnKey = makeKey("MGE", ev, "48h_before_start_warn_close_24h");
+        const closeKey = makeKey("MGE", ev, "closed_24h_before_start");
 
-      if (!state[`aoo_close_${ev.uid}`] && now >= end) {
-        await channel.send(`${PING}\n${aooClosedMsg()}`);
-        state[`aoo_close_${ev.uid}`] = true;
-        saveState();
+        const openTime = addHours(end, 24);
+        const warnTime = addHours(start, -48);
+        const closeTime = addHours(start, -24);
+
+        if (!state[openKey] && now >= openTime) {
+          await channel.send(`${PING}\n${mgeOpenMsg()}`);
+          state[openKey] = true;
+          saveState();
+        }
+
+        if (!state[warnKey] && now >= warnTime && now < closeTime) {
+          await channel.send(`${PING}\n${mgeWarnMsg()}`);
+          state[warnKey] = true;
+          saveState();
+        }
+
+        if (!state[closeKey] && now >= closeTime && now < start) {
+          await channel.send(`${PING}\n${mgeClosedMsg()}`);
+          state[closeKey] = true;
+          saveState();
+        }
       }
     }
-
-    if (type === "mge") {
-      if (!state[`mge_open_${ev.uid}`] && now >= addHours(end, 24)) {
-        await channel.send(`${PING}\n${mgeOpenMsg()}`);
-        state[`mge_open_${ev.uid}`] = true;
-        saveState();
-      }
-
-      if (
-        !state[`mge_warn_${ev.uid}`] &&
-        now >= addHours(start, -48) &&
-        now < addHours(start, -24)
-      ) {
-        await channel.send(`${PING}\n${mgeWarnMsg()}`);
-        state[`mge_warn_${ev.uid}`] = true;
-        saveState();
-      }
-
-      if (
-        !state[`mge_close_${ev.uid}`] &&
-        now >= addHours(start, -24) &&
-        now < start
-      ) {
-        await channel.send(`${PING}\n${mgeClosedMsg()}`);
-        state[`mge_close_${ev.uid}`] = true;
-        saveState();
-      }
-    }
+  } catch (e) {
+    console.error("runCheck error:", e);
+  } finally {
+    runCheckRunning = false;
   }
 }
 
@@ -217,69 +282,103 @@ const client = new Client({
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // If ping channel not set, bot will be quiet until you set it via command.
   await runCheck(client);
-  setInterval(runCheck, CHECK_EVERY_MINUTES * 60 * 1000, client);
+  setInterval(() => runCheck(client).catch(console.error), CHECK_EVERY_MINUTES * 60 * 1000);
 });
 
 /* ================= COMMANDS ================= */
 
 client.on("messageCreate", async (msg) => {
-  if (msg.author.bot || !msg.guild) return;
-  if (!msg.content.startsWith(PREFIX)) return;
+  try {
+    if (msg.author?.bot) return;
+    if (!msg.guild) return;
+    if (!msg.content?.startsWith(PREFIX)) return;
 
-  if (!hasAooRole(msg.member)) {
-    return msg.reply("❌ You need the **AOO role** to use this command.");
-  }
+    const member = msg.member;
+    if (!canUseCommands(member)) {
+      return msg.reply(
+        state.config.accessRoleId
+          ? "❌ You don’t have permission to use this bot."
+          : "❌ Access role not set yet. Only **Admins** can run setup commands right now."
+      );
+    }
 
-  const cmd = msg.content.slice(PREFIX.length).trim().toLowerCase();
+    const content = msg.content.slice(PREFIX.length).trim();
+    const [cmdRaw] = content.split(/\s+/);
+    const cmd = (cmdRaw || "").toLowerCase();
 
-  if (cmd.startsWith("set_ping_channel")) {
-    const ch = msg.mentions.channels.first();
-    if (!ch) return msg.reply("Usage: `!set_ping_channel #channel`");
-    state.config.pingChannelId = ch.id;
-    saveState();
-    return msg.reply(`✅ Ping channel set to ${ch}`);
-  }
+    if (cmd === "set_access_role") {
+      const role = msg.mentions.roles.first();
+      if (!role) return msg.reply("Usage: `!set_access_role @role`");
+      state.config.accessRoleId = role.id;
+      saveState();
+      return msg.reply(`✅ Access role set. Users with ${role} can use bot commands.`);
+    }
 
-  if (cmd.startsWith("set_mge_channel")) {
-    const ch = msg.mentions.channels.first();
-    if (!ch) return msg.reply("Usage: `!set_mge_channel #channel`");
-    state.config.mgeChannelId = ch.id;
-    saveState();
-    return msg.reply(`✅ MGE channel set to ${ch}`);
-  }
+    if (cmd === "set_ping_channel") {
+      const ch = msg.mentions.channels.first();
+      if (!ch) return msg.reply("Usage: `!set_ping_channel #channel`");
+      state.config.pingChannelId = ch.id;
+      saveState();
+      return msg.reply(`✅ Ping/announcement channel set to ${ch}`);
+    }
 
-  if (cmd.startsWith("set_mge_role")) {
-    const role = msg.mentions.roles.first();
-    if (!role) return msg.reply("Usage: `!set_mge_role @role`");
-    state.config.mgeRoleId = role.id;
-    saveState();
-    return msg.reply(`✅ MGE role set to ${role}`);
-  }
+    if (cmd === "set_aoo_team_role") {
+      const role = msg.mentions.roles.first();
+      if (!role) return msg.reply("Usage: `!set_aoo_team_role @role`");
+      state.config.aooTeamRoleId = role.id;
+      saveState();
+      return msg.reply(`✅ AOO Team role mention set to ${role}`);
+    }
 
-  if (cmd === "show_config") {
-    return msg.reply(
-      "```" +
-        [
-          `Ping channel: ${
-            state.config.pingChannelId
-              ? `<#${state.config.pingChannelId}>`
-              : "NOT SET"
-          }`,
-          `MGE channel: ${
-            state.config.mgeChannelId
-              ? `<#${state.config.mgeChannelId}>`
-              : "NOT SET"
-          }`,
-          `MGE role: ${
-            state.config.mgeRoleId
-              ? `<@&${state.config.mgeRoleId}>`
-              : "NOT SET"
-          }`,
-        ].join("\n") +
-        "```"
-    );
+    if (cmd === "clear_aoo_team_role") {
+      state.config.aooTeamRoleId = null;
+      saveState();
+      return msg.reply("✅ AOO Team role mention cleared (no role will be mentioned).");
+    }
+
+    if (cmd === "set_mge_channel") {
+      const ch = msg.mentions.channels.first();
+      if (!ch) return msg.reply("Usage: `!set_mge_channel #channel`");
+      state.config.mgeChannelId = ch.id;
+      saveState();
+      return msg.reply(`✅ MGE channel set to ${ch}`);
+    }
+
+    if (cmd === "set_mge_role") {
+      const role = msg.mentions.roles.first();
+      if (!role) return msg.reply("Usage: `!set_mge_role @role`");
+      state.config.mgeRoleId = role.id;
+      saveState();
+      return msg.reply(`✅ MGE role set to ${role}`);
+    }
+
+    if (cmd === "show_config") {
+      const lines = [
+        "Current config:",
+        `Ping channel: ${state.config.pingChannelId ? `<#${state.config.pingChannelId}>` : "NOT SET"}`,
+        `Access role: ${state.config.accessRoleId ? `<@&${state.config.accessRoleId}>` : "NOT SET (Admins only bootstrap)"}`,
+        `AOO Team role: ${state.config.aooTeamRoleId ? `<@&${state.config.aooTeamRoleId}>` : "NOT SET"}`,
+        `MGE channel: ${state.config.mgeChannelId ? `<#${state.config.mgeChannelId}>` : "NOT SET"}`,
+        `MGE role: ${state.config.mgeRoleId ? `<@&${state.config.mgeRoleId}>` : "NOT SET"}`,
+      ];
+      return msg.reply("```" + lines.join("\n") + "```");
+    }
+
+    if (cmd === "ping") {
+      return msg.reply("pong");
+    }
+
+    return msg.reply(`Unknown command. Try \`${PREFIX}show_config\``);
+  } catch (e) {
+    console.error("Command error:", e);
+    try {
+      await msg.reply("Error while processing command.");
+    } catch {}
   }
 });
 
 client.login(DISCORD_TOKEN);
+
