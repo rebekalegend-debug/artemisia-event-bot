@@ -1,0 +1,55 @@
+Privacy Policy
+
+Effective Date: 2026\02\24
+
+1. Data Collected
+
+This bot may store:
+
+Discord Server IDs
+
+Channel IDs
+
+Role IDs
+
+User IDs (only when required for bot functionality)
+
+The bot does NOT collect:
+
+Email addresses
+
+Passwords
+
+Payment information
+
+Direct messages outside bot interaction
+
+2. Purpose of Data
+
+Data is used only to:
+
+Provide reminders
+
+Manage verification
+
+Configure server settings
+
+3. Data Storage
+
+Data is stored securely and is not shared with third parties.
+
+4. Third-Party Services
+
+This bot uses:
+
+Discord API
+
+Google Calendar public ICS feeds
+
+5. Data Removal
+
+Server owners may request configuration deletion at any time.
+
+6. Contact
+
+For privacy concerns, contact: harleyqueen6581 on discord!
